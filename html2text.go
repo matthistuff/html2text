@@ -2,55 +2,91 @@ package html2text
 
 import (
 	"bytes"
+	"fmt"
 	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 	"io"
-	"regexp"
 	"strings"
 )
 
-var (
-	spacingRe = regexp.MustCompile(`[ \r\n\t]+`)
-	newlineRe = regexp.MustCompile(`\n\n+`)
-)
+// Formatters is the global formatter list.
+var Formatters = map[string]Formatter{
+	"_default": defaultFormatter{},
+	"_text":    textFormatter{},
+	"a":        aFormatter{},
+	"br":       brFormatter{},
+	"p":        pFormatter{},
+	"li":       liFormatter{},
+}
 
-func textify(node *html.Node, buf *bytes.Buffer) error {
+func textify(node *html.Node, buf *bytes.Buffer, childIndex int) error {
 	var err error
-	var noRecurse bool
+
 	switch node.Type {
 	case html.TextNode:
-		data := strings.Trim(spacingRe.ReplaceAllString(node.Data, " "), "\r\n \t")
-		if len(data) > 0 {
-			if err = buf.WriteByte('\n'); err != nil {
-				return err
-			}
-			if _, err = buf.WriteString(data); err != nil {
-				return err
-			}
-			buf.WriteByte('\n')
+		if str, err := Formatters["_text"].Format(node, childIndex); err == nil {
+			buf.WriteString(str)
 		}
 	case html.ElementNode:
-		for _, attr := range node.Attr {
-			if attr.Key == "href" {
-				if _, err = buf.WriteString(" " + attr.Val); err != nil {
-					return err
+		var (
+			formatter Formatter
+			exists    bool
+		)
+
+		if formatter, exists = Formatters[node.Data]; !exists {
+			formatter = Formatters["_default"]
+		}
+
+		if format, err := formatter.Format(node, childIndex); err == nil {
+			// Only drill down on child nodes when there is some fmt verb
+			if strings.Contains(format, "%") {
+				contentBuf := &bytes.Buffer{}
+				if err = recurse(node, contentBuf); err == nil {
+					nodeStr := fmt.Sprintf(format, contentBuf.String())
+					nodeStr = doubleSpaceRe.ReplaceAllString(nodeStr, " ")
+					nodeStr = spaceNewLineRe.ReplaceAllString(nodeStr, "\n")
+					nodeStr = multiNewLineRe.ReplaceAllString(nodeStr, "\n\n")
+
+					buf.WriteString(nodeStr)
 				}
-				noRecurse = true
-				break
+			} else {
+				buf.WriteString(format)
 			}
 		}
+	default:
+		recurse(node, buf)
 	}
-	if !noRecurse {
-		beforeLen := buf.Len()
-		for c := node.FirstChild; c != nil; c = c.NextSibling {
-			if err = textify(c, buf); err != nil {
-				return err
-			}
-		}
-		if afterLen := buf.Len(); beforeLen != afterLen {
-			buf.WriteByte('\n')
-		}
+
+	if err != nil {
+		return err
 	}
 	return nil
+}
+
+func recurse(node *html.Node, buf *bytes.Buffer) error {
+	var err error
+
+	childIndex := 0
+	for c := node.FirstChild; c != nil; c = c.NextSibling {
+		if err = textify(c, buf, childIndex); err != nil {
+			return err
+		}
+		if c.Type == html.ElementNode {
+			childIndex++
+		}
+	}
+
+	return nil
+}
+
+// IsPreformatted returns true when a node belongs to a preformatted element (<pre>)
+func IsPreformatted(node *html.Node) bool {
+	for n := node; n != nil; n = n.Parent {
+		if n.DataAtom == atom.Pre {
+			return true
+		}
+	}
+	return false
 }
 
 func FromReader(reader io.Reader) (string, error) {
@@ -59,10 +95,10 @@ func FromReader(reader io.Reader) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err = textify(doc, buf); err != nil {
+	if err = textify(doc, buf, 0); err != nil {
 		return "", err
 	}
-	text := strings.TrimSpace(newlineRe.ReplaceAllString(strings.Replace(buf.String(), "\n ", "\n", -1), "\n\n"))
+	text := strings.TrimSpace(buf.String())
 	return text, nil
 }
 
